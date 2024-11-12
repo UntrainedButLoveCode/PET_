@@ -196,7 +196,8 @@ class TransformerDecoder(nn.Module):
         self.num_layers = num_layers
         self.norm = norm
         self.return_intermediate = return_intermediate
-
+        # FFN
+        self.query_scale = MLP(d_model, d_model, d_model, 2)
     def forward(self, tgt, memory,
                 tgt_mask: Optional[Tensor] = None,
                 memory_mask: Optional[Tensor] = None,
@@ -208,6 +209,13 @@ class TransformerDecoder(nn.Module):
         output = tgt
         intermediate = []
         for idx, layer in enumerate(self.layers):
+            # For the first decoder layer, we do not apply transformation over query_pos
+            if idx == 0:
+                pos_transformation = 1
+            else:
+                pos_transformation = self.query_scale(output)
+            # apply transformation
+            query_pos = query_pos * pos_transformation
             output = layer(output, memory, tgt_mask=tgt_mask,
                         memory_mask=memory_mask,
                         tgt_key_padding_mask=tgt_key_padding_mask,
@@ -362,22 +370,24 @@ class DecoderLayer(nn.Module):
         # shape: num_queries x batch_size x 256
         q_content = self.ca_qcontent_proj(tgt)
         k_content = self.ca_kcontent_proj(memory)
-        v_ca = self.ca_v_proj(memory)
-        q_pos = self.ca_qpos_proj(query_pos)
-        k_pos = self.ca_kpos_proj(pos)
+        v = self.ca_v_proj(memory)
 
-        num_queries, bs, n_model = q_content.shape # 这里的num_queries已经窗口化，初始值为1024
+        num_queries, bs, n_model = q_content.shape  # 这里的num_queries已经窗口化，初始值为1024
         hw, _, _ = k_content.shape
+
+        k_pos = self.ca_kpos_proj(pos)
+        q_pos = self.ca_qpos_proj(query_pos)
 
         q_content = q_content.view(num_queries, bs, self.nhead, n_model // self.nhead)
         q_pos = q_pos.view(num_queries, bs, self.nhead, n_model // self.nhead)
-        q_ca = torch.cat([q_content, q_pos], dim=3).view(num_queries, bs, n_model * 2)
+        q = torch.cat([q_content, q_pos], dim=3).view(num_queries, bs, n_model * 2)
+
         k_content = k_content.view(hw, bs, self.nhead, n_model // self.nhead)
         k_pos = k_pos.view(hw, bs, self.nhead, n_model // self.nhead)
-        k_ca = torch.cat([k_content, k_pos], dim=3).view(hw, bs, n_model * 2)
-        tgt2 = self.cross_attn(query=q_ca,
-                               key=k_ca,
-                               value=v_ca, attn_mask=memory_mask,
+        k = torch.cat([k_content, k_pos], dim=3).view(hw, bs, n_model * 2)
+        tgt2 = self.cross_attn(query=q,
+                               key=k,
+                               value=v, attn_mask=memory_mask,
                                key_padding_mask=memory_key_padding_mask)[0]
         tgt = tgt + tgt2
         tgt = self.norm2(tgt)
@@ -396,6 +406,19 @@ class DecoderLayer(nn.Module):
         # tgt = self.norm3(tgt)
         # return tgt
 
+class MLP(nn.Module):
+    """ Very simple multi-layer perceptron (also called FFN)"""
+
+    def __init__(self, input_dim, hidden_dim, output_dim, num_layers):
+        super().__init__()
+        self.num_layers = num_layers
+        h = [hidden_dim] * (num_layers - 1)
+        self.layers = nn.ModuleList(nn.Linear(n, k) for n, k in zip([input_dim] + h, h + [output_dim]))
+
+    def forward(self, x):
+        for i, layer in enumerate(self.layers):
+            x = F.relu(layer(x)) if i < self.num_layers - 1 else layer(x)
+        return x
 
 def _get_clones(module, N):
     return nn.ModuleList([copy.deepcopy(module) for i in range(N)])
